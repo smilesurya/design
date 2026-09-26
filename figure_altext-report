@@ -1,0 +1,3277 @@
+#!/usr/bin/env python3
+"""
+FIGURE CAPTION + ALT TEXT EXTRACTOR (accessibility-tagged PDFs)
+
+UPDATED FIGURE NUMBER RULE
+--------------------------
+For every top-level <Figure> tag:
+
+1. Figure No. is read FIRST from:
+       <Figure> -> <P>/<Caption> -> descendant <Span>
+   Example:
+       <Figure>
+           <P>
+               <Span>Figure 4.1</Span>
+           </P>
+       </Figure>
+
+2. Caption is still detected with the existing priority:
+       a) sibling <P>/<Caption> immediately after <Figure>
+       b) nested <P>/<Caption> inside <Figure>
+
+3. If the exact nested Span hierarchy does not provide a Figure No.,
+   the existing fallbacks are preserved:
+       - nested P/Caption text
+       - any Span in Figure subtree
+       - complete Figure subtree
+       - caption-derived Figure No. as final fallback
+
+4. Alt text, page number, page labels, Excel behavior, formatting,
+   warnings, role-map handling, nested Figure skipping, and update logic
+   remain unchanged.
+
+Excel output:
+    Date | Chapter | Figure No. | Figure Page Number |
+    Figure Caption | Figure Alt Text
+
+Install:
+    pip install pikepdf openpyxl pdfminer.six
+
+Run:
+    python figure_caption_alt_extractor.py
+    python figure_caption_alt_extractor.py "D:/some/other/folder"
+"""
+
+import os
+import re
+import sys
+import copy
+import math
+import logging
+
+from datetime import datetime
+from collections import defaultdict
+
+import pikepdf
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+
+
+# ============================================================
+# pdfminer.six
+# ============================================================
+
+try:
+    from pdfminer.converter import PDFPageAggregator
+    from pdfminer.layout import LTChar, LTContainer
+    from pdfminer.pdfdocument import PDFDocument
+    from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+    from pdfminer.pdfpage import PDFPage
+    from pdfminer.pdfparser import PDFParser
+    from pdfminer.pdftypes import resolve1
+    from pdfminer.psparser import PSLiteral
+
+    PDFMINER_AVAILABLE = True
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
+
+except ImportError:
+    PDFMINER_AVAILABLE = False
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+FOLDER_PATH = (
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else r"C:\Users\Dell\Desktop\python\figure_altext"
+)
+
+EXCEL_PATH = os.path.join(
+    FOLDER_PATH,
+    "Accessibility_Report.xlsx"
+)
+
+OUTPUT_SHEET_INDEX = 1
+OUTPUT_SHEET_NAME = "Figure Caption"
+
+CAPTION_TAGS = {"P", "Caption"}
+
+CONTAINER_TAGS = {
+    "Part",
+    "Art",
+    "Sect",
+    "Div",
+    "NonStruct",
+    "Private",
+}
+
+CAPTION_LABEL_REGEX = re.compile(
+    r"^\s*("
+    r"(?i:f\s?i\s?g\s?u\s?r\s?e|f\s?i\s?g)\.?\s*"
+    r"(?:[A-Z]{1,2}[.\-\u2013\u2014]?)?"
+    r"\d+(?:[.\-\u2013\u2014]\d+)*"
+    r"(?:[a-z](?![A-Za-z]))?"
+    r")"
+)
+
+FIGURE_NO_ANYWHERE_REGEX = re.compile(
+    r"("
+    r"(?i:f\s?i\s?g\s?u\s?r\s?e|f\s?i\s?g)\.?\s*"
+    r"(?:[A-Z]{1,2}[.\-\u2013\u2014]?)?"
+    r"\d+(?:[.\-\u2013\u2014]\d+)*"
+    r"(?:[a-z](?![A-Za-z]))?"
+    r")"
+)
+
+FIGURE_NO_MODE = "caption"
+
+LEADING_JUNK_REGEX = re.compile(
+    r"^[\s\u00ad\u200b\u200c\u200d\u2060\ufeff\ufffc\ue000-\uf8ff]+"
+)
+
+MISSING_ALT_MARKER = "[MISSING ALT TEXT]"
+MISSING_CAPTION_MARKER = "[CAPTION NOT FOUND]"
+MISSING_FIGURE_NO_MARKER = "[NO FIGURE NO.]"
+
+USE_RUNNING_NUMBER_WHEN_NO_CAPTION = False
+
+RED_FILL = PatternFill(fill_type="solid", fgColor="FFC7CE")
+ORANGE_FILL = PatternFill(fill_type="solid", fgColor="FFEB9C")
+
+PAGE_NUMBER_SOURCE = "label"
+MISSING_PAGE_MARKER = "[PAGE NOT FOUND]"
+
+FIELD_ORDER = [
+    "date",
+    "chapter",
+    "figure_no",
+    "page",
+    "caption",
+    "alt",
+]
+
+CANONICAL_HEADERS = {
+    "date": "Date",
+    "chapter": "Chapter",
+    "figure_no": "Figure No.",
+    "page": "Figure Page Number",
+    "caption": "Figure Caption",
+    "alt": "Figure Alt Text",
+}
+
+HEADER_ALIASES = {
+    "date": {"date"},
+    "chapter": {"chapter"},
+    "figure_no": {
+        "figure no.",
+        "figure no",
+        "figure number",
+        "fig no.",
+        "fig no",
+    },
+    "page": {
+        "figure page number",
+        "figure page no.",
+        "figure page no",
+        "figure page",
+        "page number",
+        "page no.",
+        "page no",
+        "page",
+    },
+    "caption": {
+        "figure caption",
+        "caption",
+    },
+    "alt": {
+        "figure alt text",
+        "alt text",
+        "alt",
+    },
+}
+
+
+# ============================================================
+# PAGE MAP
+# ============================================================
+
+def build_page_map(pdf):
+    page_map = {}
+
+    for page_number, page in enumerate(pdf.pages, start=1):
+        try:
+            page_map[page.obj.objgen] = page_number
+        except Exception:
+            pass
+
+    return page_map
+
+
+# ============================================================
+# PAGE LABELS
+# ============================================================
+
+def build_page_labels(pdf):
+    labels = {}
+
+    for page_number, page in enumerate(pdf.pages, start=1):
+        try:
+            labels[page_number] = str(page.label)
+        except Exception:
+            labels[page_number] = str(page_number)
+
+    return labels
+
+
+def figure_no_value(figure):
+    if FIGURE_NO_MODE == "sequence":
+        return figure["running_no"]
+
+    if figure["figure_no"]:
+        return figure["figure_no"]
+
+    if USE_RUNNING_NUMBER_WHEN_NO_CAPTION:
+        return figure["running_no"]
+
+    return MISSING_FIGURE_NO_MARKER
+
+
+def page_cell_value(figure):
+    if not figure["page"]:
+        return MISSING_PAGE_MARKER
+
+    if PAGE_NUMBER_SOURCE == "index":
+        text = str(figure["page"])
+    else:
+        text = figure["page_label"] or str(figure["page"])
+
+    return int(text) if text.isdigit() else text
+
+
+# ============================================================
+# STRUCTURE PAGE NUMBER
+# ============================================================
+
+def get_struct_page_number(
+    struct_elem,
+    page_map,
+    inherited_page=None,
+):
+    current_page = inherited_page
+
+    try:
+        if "/Pg" in struct_elem:
+            pg = struct_elem["/Pg"]
+
+            try:
+                objgen = pg.objgen
+
+                if objgen in page_map:
+                    current_page = page_map[objgen]
+
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    return current_page
+
+
+# ============================================================
+# ROLE MAP
+# ============================================================
+
+def get_role_map(struct_root):
+    role_map = {}
+
+    try:
+        if "/RoleMap" in struct_root:
+            raw = struct_root["/RoleMap"]
+
+            for key in raw.keys():
+                role_map[str(key).lstrip("/")] = (
+                    str(raw[key]).lstrip("/")
+                )
+
+    except Exception:
+        pass
+
+    return role_map
+
+
+def resolve_tag(raw_tag, role_map):
+    tag = str(raw_tag).lstrip("/").strip()
+    seen = set()
+
+    while tag in role_map and tag not in seen:
+        seen.add(tag)
+        tag = role_map[tag]
+
+    return tag
+
+
+# ============================================================
+# FLATTEN STRUCTURE TREE
+# ============================================================
+
+def flatten_structure(
+    node,
+    page_map,
+    role_map,
+    inherited_page,
+    depth,
+    out,
+):
+    if isinstance(node, pikepdf.Array):
+        for child in node:
+            flatten_structure(
+                child,
+                page_map,
+                role_map,
+                inherited_page,
+                depth,
+                out,
+            )
+        return
+
+    if not isinstance(node, pikepdf.Dictionary):
+        return
+
+    if "/S" not in node:
+        return
+
+    current_page = get_struct_page_number(
+        node,
+        page_map,
+        inherited_page,
+    )
+
+    out.append({
+        "elem": node,
+        "tag": resolve_tag(node["/S"], role_map),
+        "page": current_page,
+        "depth": depth,
+    })
+
+    try:
+        if "/K" in node:
+            flatten_structure(
+                node["/K"],
+                page_map,
+                role_map,
+                current_page,
+                depth + 1,
+                out,
+            )
+    except Exception:
+        pass
+
+
+# ============================================================
+# PDFMINER MCID TEXT
+# ============================================================
+
+if PDFMINER_AVAILABLE:
+
+    class MarkedContentAggregator(PDFPageAggregator):
+
+        def __init__(self, rsrcmgr):
+            super().__init__(
+                rsrcmgr,
+                pageno=1,
+                laparams=None,
+            )
+
+            self.mcid_stack = []
+            self.properties = {}
+
+        def begin_tag(self, tag, props=None):
+            mcid = None
+
+            try:
+                if isinstance(props, PSLiteral):
+                    props = resolve1(
+                        self.properties.get(props.name)
+                    )
+
+                props = resolve1(props)
+
+                if (
+                    isinstance(props, dict)
+                    and "MCID" in props
+                ):
+                    mcid = int(
+                        resolve1(props["MCID"])
+                    )
+
+            except Exception:
+                mcid = None
+
+            self.mcid_stack.append(mcid)
+
+        def end_tag(self):
+            if self.mcid_stack:
+                self.mcid_stack.pop()
+
+        def current_mcid(self):
+            for mcid in reversed(self.mcid_stack):
+                if mcid is not None:
+                    return mcid
+
+            return None
+
+        def render_char(self, *args, **kwargs):
+            advance = super().render_char(
+                *args,
+                **kwargs,
+            )
+
+            try:
+                item = self.cur_item._objs[-1]
+
+                if isinstance(item, LTChar):
+                    item.mcid = self.current_mcid()
+
+            except Exception:
+                pass
+
+            return advance
+
+        def render_string(self, *args, **kwargs):
+            try:
+                super().render_string(
+                    *args,
+                    **kwargs,
+                )
+            except Exception:
+                pass
+
+        def paint_path(self, *args, **kwargs):
+            return
+
+        def render_image(self, *args, **kwargs):
+            return
+
+
+    def iter_chars(container, in_form=False):
+        for obj in container:
+
+            if isinstance(obj, LTChar):
+                yield obj, in_form
+
+            elif isinstance(obj, LTContainer):
+                yield from iter_chars(
+                    obj,
+                    True,
+                )
+
+
+def chars_to_text(chars):
+    text = ""
+    prev = None
+
+    for ch in chars:
+        value = ch.get_text()
+
+        if (
+            prev is not None
+            and value.strip()
+            and not text.endswith(" ")
+        ):
+            size = getattr(ch, "size", None) or 10
+            same_line = (
+                abs(ch.y0 - prev.y0)
+                < size * 0.5
+            )
+
+            gap = ch.x0 - prev.x1
+
+            if (
+                not same_line
+                or gap > size * 0.2
+            ):
+                text += " "
+
+        text += value
+        prev = ch
+
+    return text
+
+
+class PageTextCache:
+
+    def __init__(self, pdf_path):
+        self.pages = []
+        self.cache = {}
+        self.errors = []
+        self.init_error = None
+        self._fp = None
+
+        if not PDFMINER_AVAILABLE:
+            self.init_error = (
+                "pdfminer.six is not installed - "
+                "caption text cannot be read "
+                "(pip install pdfminer.six)."
+            )
+            return
+
+        try:
+            self._fp = open(pdf_path, "rb")
+            document = PDFDocument(
+                PDFParser(self._fp)
+            )
+
+            self.pages = list(
+                PDFPage.create_pages(document)
+            )
+
+        except Exception as e:
+            self.init_error = (
+                f"pdfminer could not open the PDF: {e}"
+            )
+
+    def close(self):
+        if self._fp is not None:
+            try:
+                self._fp.close()
+            except Exception:
+                pass
+
+    def get(
+        self,
+        page_number,
+        mcid,
+        form=False,
+    ):
+        if page_number not in self.cache:
+            self.cache[page_number] = (
+                self._build(page_number)
+            )
+
+        page_text, form_text = (
+            self.cache[page_number]
+        )
+
+        if form:
+            return (
+                form_text.get(mcid)
+                or page_text.get(mcid)
+                or ""
+            )
+
+        return (
+            page_text.get(mcid)
+            or form_text.get(mcid)
+            or ""
+        )
+
+    def get_candidates(
+        self,
+        page_number,
+        mcid,
+        form=False,
+    ):
+        if page_number not in self.cache:
+            self.cache[page_number] = (
+                self._build(page_number)
+            )
+
+        page_text, form_text = (
+            self.cache[page_number]
+        )
+
+        preferred = (
+            (form_text, page_text)
+            if form
+            else (page_text, form_text)
+        )
+
+        values = []
+
+        for mapping in preferred:
+            value = mapping.get(mcid) or ""
+            value = clean_text(value)
+
+            if (
+                value
+                and value not in values
+            ):
+                values.append(value)
+
+        return values
+
+    def _build(self, page_number):
+        page_text = {}
+        form_text = {}
+
+        if (
+            self.init_error
+            or not page_number
+        ):
+            return page_text, form_text
+
+        if page_number > len(self.pages):
+            return page_text, form_text
+
+        try:
+            page = self.pages[
+                page_number - 1
+            ]
+
+            resource_manager = (
+                PDFResourceManager()
+            )
+
+            device = MarkedContentAggregator(
+                resource_manager
+            )
+
+            try:
+                device.properties = (
+                    resolve1(
+                        page.resources.get(
+                            "Properties"
+                        )
+                    )
+                    or {}
+                )
+            except Exception:
+                device.properties = {}
+
+            interpreter = PDFPageInterpreter(
+                resource_manager,
+                device,
+            )
+
+            try:
+                interpreter.process_page(page)
+                layout = device.get_result()
+
+            except Exception as e:
+                self.errors.append(
+                    f"page {page_number}: {e}"
+                )
+
+                layout = device.cur_item
+
+            page_groups = defaultdict(list)
+            form_groups = defaultdict(list)
+
+            for ch, in_form in iter_chars(
+                layout
+            ):
+                mcid = getattr(
+                    ch,
+                    "mcid",
+                    None,
+                )
+
+                if mcid is None:
+                    continue
+
+                (
+                    form_groups
+                    if in_form
+                    else page_groups
+                )[mcid].append(ch)
+
+            for mcid, group in (
+                page_groups.items()
+            ):
+                page_text[mcid] = (
+                    chars_to_text(group)
+                )
+
+            for mcid, group in (
+                form_groups.items()
+            ):
+                form_text[mcid] = (
+                    chars_to_text(group)
+                )
+
+        except Exception as e:
+            self.errors.append(
+                f"page {page_number}: {e}"
+            )
+
+        return page_text, form_text
+
+
+# ============================================================
+# TEXT COLLECTION
+# ============================================================
+
+def _collect_text(
+    node,
+    page_map,
+    text_cache,
+    inherited_page,
+    parts,
+):
+    if isinstance(node, bool):
+        return
+
+    if isinstance(node, int):
+        if inherited_page is not None:
+            text = text_cache.get(
+                inherited_page,
+                node,
+            )
+
+            if text:
+                parts.append(text)
+
+        return
+
+    if isinstance(node, pikepdf.Array):
+        for child in node:
+            _collect_text(
+                child,
+                page_map,
+                text_cache,
+                inherited_page,
+                parts,
+            )
+        return
+
+    if not isinstance(
+        node,
+        pikepdf.Dictionary,
+    ):
+        return
+
+    if "/MCID" in node:
+        page = get_struct_page_number(
+            node,
+            page_map,
+            inherited_page,
+        )
+
+        try:
+            mcid = int(node["/MCID"])
+        except Exception:
+            return
+
+        if page is not None:
+            text = text_cache.get(
+                page,
+                mcid,
+                form="/Stm" in node,
+            )
+
+            if text:
+                parts.append(text)
+
+        return
+
+    try:
+        if "/ActualText" in node:
+            actual = str(
+                node["/ActualText"]
+            ).strip()
+
+            if actual:
+                parts.append(actual)
+                return
+
+    except Exception:
+        pass
+
+    page = get_struct_page_number(
+        node,
+        page_map,
+        inherited_page,
+    )
+
+    if "/K" in node:
+        _collect_text(
+            node["/K"],
+            page_map,
+            text_cache,
+            page,
+            parts,
+        )
+
+
+LIGATURES = {
+    "\ufb00": "ff",
+    "\ufb01": "fi",
+    "\ufb02": "fl",
+    "\ufb03": "ffi",
+    "\ufb04": "ffl",
+    "\ufb05": "st",
+    "\ufb06": "st",
+}
+
+
+def clean_text(text):
+    text = re.sub(
+        r"[\x00-\x08\x0b\x0c"
+        r"\x0e-\x1f\x7f]",
+        "",
+        text,
+    )
+
+    text = re.sub(
+        r"[\u00ad\u200b\u200c"
+        r"\u200d\u2060\ufeff]",
+        "",
+        text,
+    )
+
+    for ligature, letters in (
+        LIGATURES.items()
+    ):
+        text = text.replace(
+            ligature,
+            letters,
+        )
+
+    return re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+
+def get_element_text(
+    elem,
+    page_map,
+    text_cache,
+    inherited_page,
+):
+    parts = []
+
+    _collect_text(
+        elem,
+        page_map,
+        text_cache,
+        inherited_page,
+        parts,
+    )
+
+    return clean_text(
+        " ".join(parts)
+    )
+
+
+def _collect_text_candidates(
+    node,
+    page_map,
+    text_cache,
+    inherited_page,
+    out,
+):
+    if isinstance(node, bool):
+        return
+
+    if isinstance(node, int):
+        if inherited_page is not None:
+
+            for value in (
+                text_cache.get_candidates(
+                    inherited_page,
+                    node,
+                )
+            ):
+                if (
+                    value
+                    and value not in out
+                ):
+                    out.append(value)
+
+        return
+
+    if isinstance(node, pikepdf.Array):
+        for child in node:
+            _collect_text_candidates(
+                child,
+                page_map,
+                text_cache,
+                inherited_page,
+                out,
+            )
+
+        return
+
+    if not isinstance(
+        node,
+        pikepdf.Dictionary,
+    ):
+        return
+
+    try:
+        if "/ActualText" in node:
+            value = clean_text(
+                str(node["/ActualText"])
+            )
+
+            if (
+                value
+                and value not in out
+            ):
+                out.append(value)
+
+    except Exception:
+        pass
+
+    if "/MCID" in node:
+        page = get_struct_page_number(
+            node,
+            page_map,
+            inherited_page,
+        )
+
+        try:
+            mcid = int(node["/MCID"])
+        except Exception:
+            mcid = None
+
+        if (
+            page is not None
+            and mcid is not None
+        ):
+            for value in (
+                text_cache.get_candidates(
+                    page,
+                    mcid,
+                    form="/Stm" in node,
+                )
+            ):
+                if (
+                    value
+                    and value not in out
+                ):
+                    out.append(value)
+
+        return
+
+    page = get_struct_page_number(
+        node,
+        page_map,
+        inherited_page,
+    )
+
+    try:
+        if "/K" in node:
+            _collect_text_candidates(
+                node["/K"],
+                page_map,
+                text_cache,
+                page,
+                out,
+            )
+    except Exception:
+        pass
+
+
+def get_element_text_candidates(
+    elem,
+    page_map,
+    text_cache,
+    inherited_page,
+):
+    values = []
+
+    _collect_text_candidates(
+        elem,
+        page_map,
+        text_cache,
+        inherited_page,
+        values,
+    )
+
+    combined = get_element_text(
+        elem,
+        page_map,
+        text_cache,
+        inherited_page,
+    )
+
+    if (
+        combined
+        and combined not in values
+    ):
+        values.append(combined)
+
+    return values
+
+
+# ============================================================
+# ALT TEXT
+# ============================================================
+
+def alt_from_dict(dictionary):
+    try:
+        if "/Alt" in dictionary:
+            return clean_text(
+                str(dictionary["/Alt"])
+            )
+    except Exception:
+        pass
+
+    return ""
+
+
+def iter_attribute_dicts(elem):
+    try:
+        if "/A" not in elem:
+            return
+
+        attrs = elem["/A"]
+
+        items = (
+            list(attrs)
+            if isinstance(
+                attrs,
+                pikepdf.Array,
+            )
+            else [attrs]
+        )
+
+        for item in items:
+            if isinstance(
+                item,
+                pikepdf.Dictionary,
+            ):
+                yield item
+
+    except Exception:
+        return
+
+
+def alt_from_descendants(
+    node,
+    budget,
+):
+    if isinstance(node, pikepdf.Array):
+        for child in node:
+
+            alt = alt_from_descendants(
+                child,
+                budget,
+            )
+
+            if alt:
+                return alt
+
+        return ""
+
+    if (
+        not isinstance(
+            node,
+            pikepdf.Dictionary,
+        )
+        or "/S" not in node
+    ):
+        return ""
+
+    if budget[0] <= 0:
+        return ""
+
+    budget[0] -= 1
+
+    alt = alt_from_dict(node)
+
+    if alt:
+        return alt
+
+    try:
+        if "/K" in node:
+            return alt_from_descendants(
+                node["/K"],
+                budget,
+            )
+    except Exception:
+        pass
+
+    return ""
+
+
+def read_alt_text(figure_elem):
+    alt = alt_from_dict(
+        figure_elem
+    )
+
+    if alt:
+        return alt, "Figure tag"
+
+    for attribute in iter_attribute_dicts(
+        figure_elem
+    ):
+        alt = alt_from_dict(
+            attribute
+        )
+
+        if alt:
+            return (
+                alt,
+                "attribute object",
+            )
+
+    try:
+        if "/K" in figure_elem:
+            alt = alt_from_descendants(
+                figure_elem["/K"],
+                [500],
+            )
+
+            if alt:
+                return alt, "child tag"
+
+    except Exception:
+        pass
+
+    return "", ""
+
+
+def describe_element(
+    elem,
+    role_map,
+):
+    try:
+        keys = ", ".join(
+            sorted(
+                str(k)
+                for k in elem.keys()
+            )
+        )
+    except Exception:
+        keys = "?"
+
+    kids = []
+
+    try:
+        if "/K" in elem:
+            raw = elem["/K"]
+
+            items = (
+                list(raw)
+                if isinstance(
+                    raw,
+                    pikepdf.Array,
+                )
+                else [raw]
+            )
+
+            for child in items:
+
+                if (
+                    isinstance(
+                        child,
+                        pikepdf.Dictionary,
+                    )
+                    and "/S" in child
+                ):
+                    kids.append(
+                        resolve_tag(
+                            child["/S"],
+                            role_map,
+                        )
+                    )
+                else:
+                    kids.append(
+                        "content"
+                    )
+
+    except Exception:
+        pass
+
+    shown = ", ".join(
+        kids[:8]
+    ) + (
+        " ..."
+        if len(kids) > 8
+        else ""
+    )
+
+    return (
+        f"tag keys: {keys}; "
+        f"children: {shown or 'none'}"
+    )
+
+
+# ============================================================
+# CAPTION / FIGURE NUMBER
+# ============================================================
+
+def normalise_label(label):
+    match = re.match(
+        r"(?i)"
+        r"(f\s?i\s?g\s?u\s?r\s?e|"
+        r"f\s?i\s?g)"
+        r"(.*)$",
+        label,
+    )
+
+    if not match:
+        return label
+
+    letters = re.sub(
+        r"\s",
+        "",
+        match.group(1),
+    ).lower()
+
+    word = (
+        "Figure"
+        if letters == "figure"
+        else "Fig"
+    )
+
+    return word + match.group(2)
+
+
+def describe_following(
+    nodes,
+    figure_index,
+    page_map,
+    text_cache,
+    limit=3,
+):
+    depth = nodes[
+        figure_index
+    ]["depth"]
+
+    j = figure_index + 1
+
+    while (
+        j < len(nodes)
+        and nodes[j]["depth"] > depth
+    ):
+        j += 1
+
+    shown = []
+
+    while (
+        j < len(nodes)
+        and len(shown) < limit
+    ):
+        node = nodes[j]
+        j += 1
+
+        if (
+            node["tag"]
+            in CONTAINER_TAGS
+        ):
+            continue
+
+        text = ""
+
+        if node["tag"] in (
+            "P",
+            "Caption",
+            "H1",
+            "H2",
+            "H3",
+            "H4",
+            "Lbl",
+        ):
+            text = get_element_text(
+                node["elem"],
+                page_map,
+                text_cache,
+                node["page"],
+            )
+
+        text = (
+            text[:40]
+            + (
+                "..."
+                if len(text) > 40
+                else ""
+            )
+        )
+
+        shown.append(
+            (
+                f'<{node["tag"]}> '
+                f'"{text}"'
+            )
+            if text
+            else f'<{node["tag"]}>'
+        )
+
+    return (
+        ", ".join(shown)
+        if shown
+        else "nothing"
+    )
+
+
+def _match_caption_text(text):
+    text = clean_text(
+        text or ""
+    )
+
+    text = LEADING_JUNK_REGEX.sub(
+        "",
+        text,
+    )
+
+    if not text:
+        return None, None
+
+    match = CAPTION_LABEL_REGEX.match(
+        text
+    )
+
+    if not match:
+        return None, None
+
+    figure_no = normalise_label(
+        re.sub(
+            r"\s+",
+            " ",
+            match.group(1),
+        ).strip()
+    )
+
+    caption = (
+        figure_no
+        + text[match.end(1):]
+    )
+
+    return caption, figure_no
+
+
+def _match_figure_no_text(text):
+    text = clean_text(
+        text or ""
+    )
+
+    if not text:
+        return None
+
+    _, figure_no = (
+        _match_caption_text(text)
+    )
+
+    if figure_no:
+        return figure_no
+
+    match = (
+        FIGURE_NO_ANYWHERE_REGEX.search(
+            text
+        )
+    )
+
+    if not match:
+        return None
+
+    label = re.sub(
+        r"\s+",
+        " ",
+        match.group(1),
+    ).strip()
+
+    return normalise_label(label)
+
+
+def find_caption_sibling(
+    nodes,
+    figure_index,
+    page_map,
+    text_cache,
+):
+    figure_depth = nodes[
+        figure_index
+    ]["depth"]
+
+    j = figure_index + 1
+
+    while (
+        j < len(nodes)
+        and nodes[j]["depth"]
+        > figure_depth
+    ):
+        j += 1
+
+    while (
+        j < len(nodes)
+        and nodes[j]["tag"]
+        in CONTAINER_TAGS
+    ):
+        j += 1
+
+    if j >= len(nodes):
+        return (
+            None,
+            None,
+            "no tag follows the <Figure>",
+        )
+
+    candidate = nodes[j]
+
+    if candidate["tag"] not in (
+        CAPTION_TAGS
+    ):
+        return (
+            None,
+            None,
+            (
+                "next tag after <Figure> is "
+                f"<{candidate['tag']}>, "
+                "not one of "
+                f"{sorted(CAPTION_TAGS)}"
+            ),
+        )
+
+    page_hint = (
+        candidate["page"]
+        or nodes[
+            figure_index
+        ]["page"]
+    )
+
+    text = get_element_text(
+        candidate["elem"],
+        page_map,
+        text_cache,
+        page_hint,
+    )
+
+    raw_text = (
+        LEADING_JUNK_REGEX.sub(
+            "",
+            clean_text(
+                text or ""
+            ),
+        )
+    )
+
+    if not raw_text:
+        return (
+            None,
+            None,
+            (
+                f"the <{candidate['tag']}> "
+                "after <Figure> has no "
+                "readable text "
+                f"(PDF page {page_hint})"
+            ),
+        )
+
+    caption, figure_no = (
+        _match_caption_text(
+            raw_text
+        )
+    )
+
+    if not caption:
+        snippet = (
+            raw_text
+            if len(raw_text) <= 60
+            else (
+                raw_text[:57]
+                + "..."
+            )
+        )
+
+        return (
+            None,
+            None,
+            (
+                f"the <{candidate['tag']}> "
+                "after <Figure> does not "
+                "start with 'Figure N' / "
+                f"'Fig. N' (\"{snippet}\")"
+            ),
+        )
+
+    return (
+        caption,
+        figure_no,
+        None,
+    )
+
+
+def find_caption_in_figure(
+    nodes,
+    figure_index,
+    page_map,
+    text_cache,
+):
+    figure_depth = nodes[
+        figure_index
+    ]["depth"]
+
+    figure_page = nodes[
+        figure_index
+    ]["page"]
+
+    j = figure_index + 1
+
+    checked_any = False
+
+    while (
+        j < len(nodes)
+        and nodes[j]["depth"]
+        > figure_depth
+    ):
+        node = nodes[j]
+
+        if node["tag"] in (
+            CAPTION_TAGS
+        ):
+            checked_any = True
+
+            page_hint = (
+                node["page"]
+                or figure_page
+            )
+
+            text = get_element_text(
+                node["elem"],
+                page_map,
+                text_cache,
+                page_hint,
+            )
+
+            caption, figure_no = (
+                _match_caption_text(text)
+            )
+
+            if caption:
+                return (
+                    caption,
+                    figure_no,
+                    None,
+                )
+
+        j += 1
+
+    if not checked_any:
+        return (
+            None,
+            None,
+            (
+                "no <P>/<Caption> tag "
+                "found nested inside "
+                "the <Figure>"
+            ),
+        )
+
+    return (
+        None,
+        None,
+        (
+            "found <P>/<Caption> tag(s) "
+            "nested inside the <Figure>, "
+            "but none of their merged "
+            "text starts with "
+            "'Figure N' / 'Fig. N'"
+        ),
+    )
+
+
+def find_figure_no_in_figure(
+    nodes,
+    figure_index,
+    page_map,
+    text_cache,
+):
+    """
+    UPDATED PRIORITY
+
+    1. <Figure> -> <P>/<Caption> -> descendant <Span>
+    2. nested <P>/<Caption> text
+    3. any <Span> in current Figure
+    4. full Figure subtree
+
+    This function returns ONLY the Figure No.
+    """
+
+    figure_depth = nodes[
+        figure_index
+    ]["depth"]
+
+    figure_page = nodes[
+        figure_index
+    ]["page"]
+
+    subtree_end = (
+        figure_index + 1
+    )
+
+    while (
+        subtree_end < len(nodes)
+        and nodes[
+            subtree_end
+        ]["depth"] > figure_depth
+    ):
+        subtree_end += 1
+
+    def number_from_node(
+        node,
+        fallback_page=None,
+    ):
+        page_hint = (
+            node["page"]
+            or fallback_page
+            or figure_page
+        )
+
+        for candidate_text in (
+            get_element_text_candidates(
+                node["elem"],
+                page_map,
+                text_cache,
+                page_hint,
+            )
+        ):
+            figure_no = (
+                _match_figure_no_text(
+                    candidate_text
+                )
+            )
+
+            if figure_no:
+                return figure_no
+
+        return None
+
+    # --------------------------------------------------------
+    # PASS 1
+    # Exact required hierarchy:
+    # <Figure> -> <P>/<Caption> -> ... -> <Span>
+    # --------------------------------------------------------
+
+    j = figure_index + 1
+
+    while j < subtree_end:
+        parent = nodes[j]
+
+        if parent["tag"] in (
+            CAPTION_TAGS
+        ):
+            parent_depth = (
+                parent["depth"]
+            )
+
+            k = j + 1
+
+            while (
+                k < subtree_end
+                and nodes[k]["depth"]
+                > parent_depth
+            ):
+                child = nodes[k]
+
+                if child["tag"] == "Span":
+
+                    figure_no = (
+                        number_from_node(
+                            child,
+                            parent["page"]
+                            or figure_page,
+                        )
+                    )
+
+                    if figure_no:
+                        return (
+                            figure_no,
+                            None,
+                        )
+
+                k += 1
+
+        j += 1
+
+    # --------------------------------------------------------
+    # PASS 2
+    # Nested P/Caption text fallback.
+    # --------------------------------------------------------
+
+    for j in range(
+        figure_index + 1,
+        subtree_end,
+    ):
+        node = nodes[j]
+
+        if node["tag"] not in (
+            CAPTION_TAGS
+        ):
+            continue
+
+        figure_no = number_from_node(
+            node,
+            figure_page,
+        )
+
+        if figure_no:
+            return (
+                figure_no,
+                None,
+            )
+
+    # --------------------------------------------------------
+    # PASS 3
+    # Any Span inside Figure subtree.
+    # --------------------------------------------------------
+
+    for j in range(
+        figure_index + 1,
+        subtree_end,
+    ):
+        node = nodes[j]
+
+        if node["tag"] != "Span":
+            continue
+
+        figure_no = number_from_node(
+            node,
+            figure_page,
+        )
+
+        if figure_no:
+            return (
+                figure_no,
+                None,
+            )
+
+    # --------------------------------------------------------
+    # PASS 4
+    # Complete Figure subtree.
+    # --------------------------------------------------------
+
+    figure_node = nodes[
+        figure_index
+    ]
+
+    figure_no = number_from_node(
+        figure_node,
+        figure_page,
+    )
+
+    if figure_no:
+        return (
+            figure_no,
+            None,
+        )
+
+    return (
+        None,
+        (
+            "no Figure/Fig. number "
+            "could be read from "
+            "<Figure> -> "
+            "<P>/<Caption> -> <Span>"
+        ),
+    )
+
+
+def find_caption(
+    nodes,
+    figure_index,
+    page_map,
+    text_cache,
+):
+    """
+    UPDATED BEHAVIOUR
+
+    Figure No. is extracted independently FIRST.
+
+    Figure No. priority:
+      1. <Figure> -> <P>/<Caption> -> <Span>
+      2. Existing fallbacks inside the Figure
+      3. Caption-derived number only if nested Figure number
+         could not be found
+
+    Caption priority remains unchanged:
+      1. sibling <P>/<Caption>
+      2. nested <P>/<Caption>
+    """
+
+    # --------------------------------------------------------
+    # STEP 1
+    # Read Figure No. from the Figure subtree FIRST.
+    # --------------------------------------------------------
+
+    nested_figure_no, reason_number = (
+        find_figure_no_in_figure(
+            nodes,
+            figure_index,
+            page_map,
+            text_cache,
+        )
+    )
+
+    # --------------------------------------------------------
+    # STEP 2
+    # Existing sibling caption behaviour.
+    # --------------------------------------------------------
+
+    (
+        sibling_caption,
+        sibling_caption_no,
+        reason_sibling,
+    ) = find_caption_sibling(
+        nodes,
+        figure_index,
+        page_map,
+        text_cache,
+    )
+
+    if sibling_caption:
+        figure_no = (
+            nested_figure_no
+            or sibling_caption_no
+        )
+
+        return (
+            sibling_caption,
+            figure_no,
+            None,
+        )
+
+    # --------------------------------------------------------
+    # STEP 3
+    # Existing nested caption behaviour.
+    # --------------------------------------------------------
+
+    (
+        nested_caption,
+        nested_caption_no,
+        reason_nested,
+    ) = find_caption_in_figure(
+        nodes,
+        figure_index,
+        page_map,
+        text_cache,
+    )
+
+    if nested_caption:
+        figure_no = (
+            nested_figure_no
+            or nested_caption_no
+        )
+
+        return (
+            nested_caption,
+            figure_no,
+            None,
+        )
+
+    # --------------------------------------------------------
+    # STEP 4
+    # No caption, but Figure No. exists.
+    # --------------------------------------------------------
+
+    if nested_figure_no:
+        return (
+            None,
+            nested_figure_no,
+            (
+                f"{reason_sibling}; "
+                f"{reason_nested}"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # STEP 5
+    # Nothing found.
+    # --------------------------------------------------------
+
+    return (
+        None,
+        None,
+        (
+            f"{reason_sibling}; "
+            f"{reason_nested}; "
+            f"{reason_number}"
+        ),
+    )
+
+
+# ============================================================
+# EXTRACT FIGURES
+# ============================================================
+
+def extract_figures(pdf_path):
+    figures = []
+    warnings = []
+
+    text_cache = PageTextCache(
+        pdf_path
+    )
+
+    try:
+        if text_cache.init_error:
+            warnings.append(
+                text_cache.init_error
+            )
+
+        with pikepdf.open(
+            pdf_path
+        ) as pdf:
+
+            if (
+                "/StructTreeRoot"
+                not in pdf.Root
+            ):
+                warnings.append(
+                    "PDF is not tagged "
+                    "(no StructTreeRoot) - "
+                    "no figures can be "
+                    "extracted."
+                )
+
+                return (
+                    figures,
+                    warnings,
+                )
+
+            struct_root = (
+                pdf.Root[
+                    "/StructTreeRoot"
+                ]
+            )
+
+            page_map = build_page_map(
+                pdf
+            )
+
+            page_labels = (
+                build_page_labels(pdf)
+            )
+
+            role_map = get_role_map(
+                struct_root
+            )
+
+            nodes = []
+
+            if "/K" in struct_root:
+                flatten_structure(
+                    struct_root["/K"],
+                    page_map,
+                    role_map,
+                    None,
+                    0,
+                    nodes,
+                )
+
+            nested_until = -1
+
+            for index, item in (
+                enumerate(nodes)
+            ):
+                if (
+                    item["tag"]
+                    != "Figure"
+                ):
+                    continue
+
+                if index < nested_until:
+                    continue
+
+                nested_until = (
+                    index + 1
+                )
+
+                while (
+                    nested_until
+                    < len(nodes)
+                    and nodes[
+                        nested_until
+                    ]["depth"]
+                    > item["depth"]
+                ):
+                    nested_until += 1
+
+                sequence = (
+                    len(figures) + 1
+                )
+
+                page = item["page"]
+
+                where = (
+                    f"Figure #{sequence} "
+                    "in PDF "
+                    f"(PDF page {page})"
+                    if page
+                    else (
+                        f"Figure #{sequence} "
+                        "in PDF"
+                    )
+                )
+
+                # ALT TEXT
+                alt, alt_source = (
+                    read_alt_text(
+                        item["elem"]
+                    )
+                )
+
+                if not alt:
+                    warnings.append(
+                        f"{where}: "
+                        "Alt Text is "
+                        "missing/empty "
+                        f"({describe_element(item['elem'], role_map)})."
+                    )
+
+                elif (
+                    alt_source
+                    != "Figure tag"
+                ):
+                    warnings.append(
+                        f"{where}: "
+                        "Alt Text was not "
+                        "on the <Figure> "
+                        "tag itself - "
+                        "taken from its "
+                        f"{alt_source}."
+                    )
+
+                # CAPTION + FIGURE NO.
+                (
+                    caption,
+                    figure_no,
+                    reason,
+                ) = find_caption(
+                    nodes,
+                    index,
+                    page_map,
+                    text_cache,
+                )
+
+                if not caption:
+                    warnings.append(
+                        f"{where}: "
+                        "caption not found - "
+                        f"{reason}. "
+                        "Tags after the "
+                        "figure: "
+                        f"{describe_following(nodes, index, page_map, text_cache)}"
+                    )
+
+                figures.append({
+                    "page": page,
+                    "page_label": (
+                        page_labels.get(
+                            page,
+                            "",
+                        )
+                        if page
+                        else ""
+                    ),
+                    "figure_no": (
+                        figure_no
+                        or ""
+                    ),
+                    "running_no": (
+                        f"Figure {sequence}"
+                    ),
+                    "caption": (
+                        caption
+                        or ""
+                    ),
+                    "alt": alt,
+                })
+
+            for message in (
+                text_cache.errors
+            ):
+                warnings.append(
+                    "Could not read "
+                    "page text - "
+                    f"{message}"
+                )
+
+            if not figures:
+                warnings.append(
+                    "No <Figure> tags "
+                    "found in this PDF."
+                )
+
+    finally:
+        text_cache.close()
+
+    return figures, warnings
+
+
+# ============================================================
+# EXCEL CREATE / OPEN / SAVE
+# ============================================================
+
+def style_header_cells(cells):
+    yellow_fill = PatternFill(
+        fill_type="solid",
+        fgColor="FFFF00",
+    )
+
+    thin_border = Border(
+        left=Side(
+            style="thin",
+            color="000000",
+        ),
+        right=Side(
+            style="thin",
+            color="000000",
+        ),
+        top=Side(
+            style="thin",
+            color="000000",
+        ),
+        bottom=Side(
+            style="thin",
+            color="000000",
+        ),
+    )
+
+    for cell in cells:
+        cell.fill = yellow_fill
+        cell.font = Font(
+            bold=True
+        )
+
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+        )
+
+        cell.border = thin_border
+
+
+def write_default_headers(
+    worksheet,
+):
+    for col, field in enumerate(
+        FIELD_ORDER,
+        start=1,
+    ):
+        worksheet.cell(
+            row=1,
+            column=col,
+        ).value = (
+            CANONICAL_HEADERS[field]
+        )
+
+    style_header_cells(
+        [
+            worksheet.cell(
+                row=1,
+                column=c,
+            )
+            for c in range(
+                1,
+                len(FIELD_ORDER) + 1,
+            )
+        ]
+    )
+
+    for column, width in {
+        "A": 15,
+        "B": 45,
+        "C": 14,
+        "D": 20,
+        "E": 60,
+        "F": 80,
+    }.items():
+        worksheet.column_dimensions[
+            column
+        ].width = width
+
+
+def create_excel():
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = (
+        OUTPUT_SHEET_NAME
+    )
+
+    write_default_headers(
+        worksheet
+    )
+
+    workbook.save(
+        EXCEL_PATH
+    )
+
+
+def open_workbook():
+    created_new = False
+
+    if not os.path.exists(
+        EXCEL_PATH
+    ):
+        print(
+            "\nExcel not found - "
+            "creating a new workbook."
+        )
+
+        create_excel()
+        created_new = True
+
+    try:
+        return (
+            load_workbook(
+                EXCEL_PATH
+            ),
+            created_new,
+        )
+
+    except PermissionError:
+        raise RuntimeError(
+            "Cannot open the Excel "
+            "file. Close it in "
+            "Excel/LibreOffice and "
+            "run again: "
+            f"{EXCEL_PATH}"
+        )
+
+
+def looks_like_output_sheet(
+    worksheet,
+):
+    fields = set()
+
+    for cell in worksheet[1]:
+        if cell.value is None:
+            continue
+
+        key = str(
+            cell.value
+        ).strip().lower()
+
+        for field, aliases in (
+            HEADER_ALIASES.items()
+        ):
+            if key in aliases:
+                fields.add(field)
+
+    return {
+        "chapter",
+        "caption",
+        "alt",
+    } <= fields
+
+
+def get_output_sheet(
+    workbook,
+    created_new,
+):
+    if created_new:
+        return (
+            workbook.worksheets[0]
+        )
+
+    if (
+        len(workbook.worksheets)
+        > OUTPUT_SHEET_INDEX
+    ):
+        return (
+            workbook.worksheets[
+                OUTPUT_SHEET_INDEX
+            ]
+        )
+
+    only_sheet = (
+        workbook.worksheets[0]
+    )
+
+    if looks_like_output_sheet(
+        only_sheet
+    ):
+        return only_sheet
+
+    print(
+        "\nWorkbook has only "
+        f"{len(workbook.worksheets)} "
+        "sheet(s) - adding sheet "
+        f"'{OUTPUT_SHEET_NAME}'."
+    )
+
+    sheet = workbook.create_sheet(
+        OUTPUT_SHEET_NAME
+    )
+
+    write_default_headers(
+        sheet
+    )
+
+    return sheet
+
+
+def save_workbook(workbook):
+    try:
+        workbook.save(
+            EXCEL_PATH
+        )
+
+    except PermissionError:
+        raise PermissionError(
+            "Cannot save the Excel "
+            "file - it is open in "
+            "another program. "
+            "Close it and run again: "
+            f"{EXCEL_PATH}"
+        )
+
+
+# ============================================================
+# EXCEL HEADER / COLUMNS
+# ============================================================
+
+def get_header_cells(
+    worksheet,
+):
+    return [
+        c
+        for c in worksheet[1]
+        if (
+            c.value is not None
+            and str(
+                c.value
+            ).strip() != ""
+        )
+    ]
+
+
+def map_columns(
+    worksheet,
+):
+    columns = {}
+
+    for cell in get_header_cells(
+        worksheet
+    ):
+        key = str(
+            cell.value
+        ).strip().lower()
+
+        for field, aliases in (
+            HEADER_ALIASES.items()
+        ):
+            if (
+                key in aliases
+                and field
+                not in columns
+            ):
+                columns[field] = (
+                    cell.column
+                )
+
+    return columns
+
+
+def insert_column(
+    worksheet,
+    position,
+):
+    max_col = (
+        worksheet.max_column
+    )
+
+    widths = {}
+
+    for col in range(
+        position,
+        max_col + 1,
+    ):
+        letter = (
+            get_column_letter(col)
+        )
+
+        if (
+            letter
+            in worksheet.column_dimensions
+        ):
+            widths[col] = (
+                worksheet
+                .column_dimensions[
+                    letter
+                ].width
+            )
+
+    worksheet.insert_cols(
+        position
+    )
+
+    for col, width in (
+        widths.items()
+    ):
+        if width:
+            worksheet.column_dimensions[
+                get_column_letter(
+                    col + 1
+                )
+            ].width = width
+
+
+def prepare_output_sheet(
+    worksheet,
+):
+    if not get_header_cells(
+        worksheet
+    ):
+        write_default_headers(
+            worksheet
+        )
+
+    columns = map_columns(
+        worksheet
+    )
+
+    # Figure No.
+    if "figure_no" not in columns:
+
+        headers = get_header_cells(
+            worksheet
+        )
+
+        if "chapter" in columns:
+            position = (
+                columns["chapter"]
+                + 1
+            )
+
+            insert_column(
+                worksheet,
+                position,
+            )
+
+            style_source = (
+                worksheet.cell(
+                    row=1,
+                    column=columns[
+                        "chapter"
+                    ],
+                )
+            )
+
+        else:
+            position = (
+                headers[-1].column
+                + 1
+            )
+
+            style_source = (
+                headers[-1]
+            )
+
+        new_cell = worksheet.cell(
+            row=1,
+            column=position,
+        )
+
+        new_cell.value = (
+            CANONICAL_HEADERS[
+                "figure_no"
+            ]
+        )
+
+        new_cell._style = (
+            copy.copy(
+                style_source._style
+            )
+        )
+
+        worksheet.column_dimensions[
+            get_column_letter(
+                position
+            )
+        ].width = 14
+
+        columns = map_columns(
+            worksheet
+        )
+
+    # Page number
+    if "page" not in columns:
+
+        position = (
+            columns["figure_no"]
+            + 1
+        )
+
+        insert_column(
+            worksheet,
+            position,
+        )
+
+        style_source = (
+            worksheet.cell(
+                row=1,
+                column=columns[
+                    "figure_no"
+                ],
+            )
+        )
+
+        new_cell = worksheet.cell(
+            row=1,
+            column=position,
+        )
+
+        new_cell.value = (
+            CANONICAL_HEADERS[
+                "page"
+            ]
+        )
+
+        new_cell._style = (
+            copy.copy(
+                style_source._style
+            )
+        )
+
+        worksheet.column_dimensions[
+            get_column_letter(
+                position
+            )
+        ].width = 20
+
+        columns = map_columns(
+            worksheet
+        )
+
+    # Other missing headers
+    for field in (
+        "date",
+        "chapter",
+        "caption",
+        "alt",
+    ):
+        if field in columns:
+            continue
+
+        headers = get_header_cells(
+            worksheet
+        )
+
+        position = (
+            headers[-1].column
+            + 1
+        )
+
+        new_cell = worksheet.cell(
+            row=1,
+            column=position,
+        )
+
+        new_cell.value = (
+            CANONICAL_HEADERS[
+                field
+            ]
+        )
+
+        new_cell._style = (
+            copy.copy(
+                headers[-1]._style
+            )
+        )
+
+        columns = map_columns(
+            worksheet
+        )
+
+    known = set(
+        columns.values()
+    )
+
+    extra = [
+        str(c.value)
+        for c in get_header_cells(
+            worksheet
+        )
+        if c.column not in known
+    ]
+
+    if extra:
+        print(
+            "  NOTE: output sheet "
+            "has extra column(s) "
+            f"{', '.join(extra)} - "
+            "ignored (output should "
+            "have only the six "
+            "required columns)."
+        )
+
+    return columns
+
+
+# ============================================================
+# EXCEL ROW HELPERS
+# ============================================================
+
+def find_chapter_rows(
+    worksheet,
+    chapter_col,
+    chapter_name,
+):
+    rows = []
+
+    for row in range(
+        2,
+        worksheet.max_row + 1,
+    ):
+        value = worksheet.cell(
+            row=row,
+            column=chapter_col,
+        ).value
+
+        if value is None:
+            continue
+
+        if (
+            str(value)
+            .strip()
+            .lower()
+            == chapter_name
+            .strip()
+            .lower()
+        ):
+            rows.append(row)
+
+    return rows
+
+
+def last_used_row(worksheet):
+    for row in range(
+        worksheet.max_row,
+        1,
+        -1,
+    ):
+        if any(
+            c.value not in (
+                None,
+                "",
+            )
+            for c in worksheet[row]
+        ):
+            return row
+
+    return 1
+
+
+def excel_safe(value):
+    if isinstance(
+        value,
+        str,
+    ):
+        return (
+            ILLEGAL_CHARACTERS_RE.sub(
+                "",
+                value,
+            )
+        )
+
+    return value
+
+
+def get_column_width(
+    worksheet,
+    column,
+):
+    letter = get_column_letter(
+        column
+    )
+
+    try:
+        if (
+            letter
+            in worksheet.column_dimensions
+        ):
+            width = (
+                worksheet
+                .column_dimensions[
+                    letter
+                ].width
+            )
+
+            if width:
+                return width
+
+    except Exception:
+        pass
+
+    return 13
+
+
+def estimate_row_height(
+    worksheet,
+    row,
+    columns,
+):
+    lines_needed = 1
+
+    for field in (
+        "caption",
+        "alt",
+    ):
+        value = worksheet.cell(
+            row=row,
+            column=columns[field],
+        ).value
+
+        if not value:
+            continue
+
+        chars_per_line = max(
+            8,
+            int(
+                get_column_width(
+                    worksheet,
+                    columns[field],
+                )
+                * 1.05
+            ),
+        )
+
+        lines = sum(
+            max(
+                1,
+                math.ceil(
+                    len(part)
+                    / chars_per_line
+                ),
+            )
+            for part in str(
+                value
+            ).split("\n")
+        )
+
+        lines_needed = max(
+            lines_needed,
+            lines,
+        )
+
+    return min(
+        409,
+        max(
+            15,
+            lines_needed * 15,
+        ),
+    )
+
+
+# ============================================================
+# WRITE FIGURES TO EXCEL
+# ============================================================
+
+def write_figures_to_excel(
+    worksheet,
+    chapter,
+    figures,
+):
+    columns = (
+        prepare_output_sheet(
+            worksheet
+        )
+    )
+
+    current_date = (
+        datetime.now().strftime(
+            "%d-%m-%Y"
+        )
+    )
+
+    existing_rows = (
+        find_chapter_rows(
+            worksheet,
+            columns["chapter"],
+            chapter,
+        )
+    )
+
+    center = Alignment(
+        horizontal="center",
+        vertical="top",
+    )
+
+    left_wrap = Alignment(
+        horizontal="left",
+        vertical="top",
+        wrap_text=True,
+    )
+
+    thin_border = Border(
+        left=Side(
+            style="thin",
+            color="D9D9D9",
+        ),
+        right=Side(
+            style="thin",
+            color="D9D9D9",
+        ),
+        top=Side(
+            style="thin",
+            color="D9D9D9",
+        ),
+        bottom=Side(
+            style="thin",
+            color="D9D9D9",
+        ),
+    )
+
+    next_row = (
+        last_used_row(
+            worksheet
+        )
+        + 1
+    )
+
+    for position, figure in (
+        enumerate(figures)
+    ):
+        if position < len(
+            existing_rows
+        ):
+            row = (
+                existing_rows[
+                    position
+                ]
+            )
+
+        else:
+            row = next_row
+            next_row += 1
+
+        values = {
+            "date": current_date,
+            "chapter": chapter,
+            "figure_no": (
+                figure_no_value(
+                    figure
+                )
+            ),
+            "page": (
+                page_cell_value(
+                    figure
+                )
+            ),
+            "caption": (
+                figure["caption"]
+                or MISSING_CAPTION_MARKER
+            ),
+            "alt": (
+                figure["alt"]
+                or MISSING_ALT_MARKER
+            ),
+        }
+
+        for field, value in (
+            values.items()
+        ):
+            cell = worksheet.cell(
+                row=row,
+                column=columns[field],
+            )
+
+            cell.value = excel_safe(
+                value
+            )
+
+            cell.border = (
+                thin_border
+            )
+
+            cell.alignment = (
+                left_wrap
+                if field in (
+                    "caption",
+                    "alt",
+                )
+                else center
+            )
+
+            cell.fill = PatternFill(
+                fill_type=None
+            )
+
+        if (
+            FIGURE_NO_MODE
+            != "sequence"
+            and not figure[
+                "figure_no"
+            ]
+        ):
+            worksheet.cell(
+                row=row,
+                column=columns[
+                    "figure_no"
+                ],
+            ).fill = ORANGE_FILL
+
+        if not figure["caption"]:
+            worksheet.cell(
+                row=row,
+                column=columns[
+                    "caption"
+                ],
+            ).fill = RED_FILL
+
+        if not figure["alt"]:
+            worksheet.cell(
+                row=row,
+                column=columns[
+                    "alt"
+                ],
+            ).fill = RED_FILL
+
+        worksheet.row_dimensions[
+            row
+        ].height = (
+            estimate_row_height(
+                worksheet,
+                row,
+                columns,
+            )
+        )
+
+    for row in sorted(
+        existing_rows[
+            len(figures):
+        ],
+        reverse=True,
+    ):
+        worksheet.delete_rows(
+            row
+        )
+
+
+# ============================================================
+# GET PDF FILES
+# ============================================================
+
+def get_pdf_files():
+    if not os.path.exists(
+        FOLDER_PATH
+    ):
+        raise RuntimeError(
+            "Folder does not exist: "
+            f"{FOLDER_PATH}"
+        )
+
+    pdf_files = [
+        f
+        for f in os.listdir(
+            FOLDER_PATH
+        )
+        if f.lower().endswith(
+            ".pdf"
+        )
+    ]
+
+    pdf_files.sort()
+
+    return pdf_files
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("=" * 70)
+    print(
+        "FIGURE CAPTION + "
+        "ALT TEXT EXTRACTION"
+    )
+    print("=" * 70)
+
+    print(
+        f"\nFolder: {FOLDER_PATH}"
+    )
+    print(
+        f"Excel : {EXCEL_PATH}"
+    )
+
+    try:
+        pdf_files = (
+            get_pdf_files()
+        )
+
+    except RuntimeError as e:
+        print(
+            f"\nERROR: {e}"
+        )
+        return
+
+    if not pdf_files:
+        print(
+            "\nNo PDF files found."
+        )
+        return
+
+    print(
+        "\nPDF files found: "
+        f"{len(pdf_files)}"
+    )
+
+    try:
+        (
+            workbook,
+            created_new,
+        ) = open_workbook()
+
+        output_sheet = (
+            get_output_sheet(
+                workbook,
+                created_new,
+            )
+        )
+
+    except RuntimeError as e:
+        print(
+            f"\nERROR: {e}"
+        )
+        return
+
+    print(
+        "Output sheet: "
+        f"'{output_sheet.title}'"
+    )
+
+    summary = []
+    errors = []
+
+    for index, pdf_file in (
+        enumerate(
+            pdf_files,
+            start=1,
+        )
+    ):
+        print(
+            "\n"
+            + "=" * 70
+        )
+
+        print(
+            f"[{index}/"
+            f"{len(pdf_files)}] "
+            "Processing: "
+            f"{pdf_file}"
+        )
+
+        pdf_path = os.path.join(
+            FOLDER_PATH,
+            pdf_file,
+        )
+
+        chapter = (
+            os.path.splitext(
+                pdf_file
+            )[0]
+        )
+
+        try:
+            print(
+                f"Chapter : {chapter}"
+            )
+
+            (
+                figures,
+                warnings,
+            ) = extract_figures(
+                pdf_path
+            )
+
+            print(
+                "Figures found: "
+                f"{len(figures)}"
+            )
+
+            for figure in figures:
+
+                figure_label = (
+                    figure_no_value(
+                        figure
+                    )
+                )
+
+                alt_preview = (
+                    figure["alt"][:45]
+                    + (
+                        "..."
+                        if len(
+                            figure["alt"]
+                        ) > 45
+                        else ""
+                    )
+                )
+
+                print(
+                    f"  {figure_label:<15} "
+                    "page "
+                    f"{page_cell_value(figure)}  "
+                    "caption="
+                    f"{'YES' if figure['caption'] else 'NO '}  "
+                    "alt="
+                    f"{'YES' if figure['alt'] else 'NO '}"
+                    + (
+                        f'  "{alt_preview}"'
+                        if figure["alt"]
+                        else ""
+                    )
+                )
+
+            for message in warnings:
+                print(
+                    "  WARNING: "
+                    f"{message}"
+                )
+
+            write_figures_to_excel(
+                output_sheet,
+                chapter,
+                figures,
+            )
+
+            save_workbook(
+                workbook
+            )
+
+            print(
+                "Excel updated "
+                "successfully."
+            )
+
+            summary.append((
+                pdf_file,
+                len(figures),
+                sum(
+                    1
+                    for f in figures
+                    if not f[
+                        "figure_no"
+                    ]
+                ),
+                sum(
+                    1
+                    for f in figures
+                    if not f[
+                        "caption"
+                    ]
+                ),
+                sum(
+                    1
+                    for f in figures
+                    if not f[
+                        "alt"
+                    ]
+                ),
+                [
+                    w
+                    for w in warnings
+                    if (
+                        "not tagged" in w
+                        or "not installed"
+                        in w
+                        or "could not"
+                        in w.lower()
+                    )
+                ],
+            ))
+
+        except PermissionError as e:
+            print(
+                f"\nERROR: {e}"
+            )
+            return
+
+        except Exception as e:
+            if isinstance(
+                e,
+                pikepdf.PasswordError,
+            ):
+                msg = (
+                    "PDF is password "
+                    "protected - skipped."
+                )
+            else:
+                msg = (
+                    f"{type(e).__name__}: "
+                    f"{e}"
+                )
+
+            print(
+                "ERROR processing "
+                f"{pdf_file}: "
+                f"{msg}"
+            )
+
+            errors.append((
+                pdf_file,
+                msg,
+            ))
+
+            try:
+                (
+                    workbook,
+                    created_new,
+                ) = open_workbook()
+
+                output_sheet = (
+                    get_output_sheet(
+                        workbook,
+                        created_new,
+                    )
+                )
+
+            except RuntimeError as reload_error:
+                print(
+                    "\nERROR: "
+                    f"{reload_error}"
+                )
+                return
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+    print("SUMMARY")
+    print("=" * 70)
+
+    for (
+        name,
+        total,
+        no_number,
+        no_caption,
+        no_alt,
+        notes,
+    ) in summary:
+
+        print(
+            f"- {name}: "
+            f"{total} figure(s) | "
+            "no figure no.: "
+            f"{no_number} | "
+            "no caption: "
+            f"{no_caption} | "
+            "no alt text: "
+            f"{no_alt}"
+        )
+
+        for note in notes:
+            print(
+                "    NOTE: "
+                f"{note}"
+            )
+
+    for name, msg in errors:
+        print(
+            f"- {name}: "
+            "NOT WRITTEN TO EXCEL "
+            f"- {msg}"
+        )
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+    print("COMPLETED")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
